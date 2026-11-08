@@ -525,22 +525,7 @@ function looksUntranslated(value, original, lang) {
 }
 
 /** Gemini translation in batches keeps request counts low and the key server-side. */
-async function translateWithGemini(texts, lang) {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  if (!apiKey || !texts.length) return null;
-  const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-  const languageName = ({ ko: 'Korean', ja: 'Japanese', zh: 'Chinese', th: 'Thai', vi: 'Vietnamese',
-    id: 'Indonesian', es: 'Spanish', pt: 'Portuguese', fr: 'French', de: 'German', ar: 'Arabic' })[lang] || lang;
-  const prompt = `Translate each input string from ${languageName} into faithful, natural English. Do not summarize or add facts. Preserve proper names, group and member names, dates, numbers, punctuation, and meaning. Return exactly one translated string per input, in the same order, as a JSON array of strings only.\nINPUT:\n${JSON.stringify(texts)}`;
-  const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-      maxOutputTokens: 8192
-    }
-  });
+async function requestGemini(model, body, apiKey) {
   return new Promise((resolve) => {
     const req = https.request({
       hostname: 'generativelanguage.googleapis.com',
@@ -557,25 +542,64 @@ async function translateWithGemini(texts, lang) {
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         try {
-          const d = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          if (res.statusCode < 200 || res.statusCode >= 300) {
-            console.error('Gemini translation request failed:', res.statusCode, d.error?.message || 'API error');
-            return resolve(null);
-          }
-          const raw = (((d.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('').trim();
-          const parsed = JSON.parse(raw);
-          resolve(Array.isArray(parsed) ? parsed.map((v) => String(v || '').trim()) : null);
+          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          resolve({ status: res.statusCode, data, retryAfter: Number(res.headers['retry-after']) || 0 });
         } catch (e) {
-          console.error('Gemini translation response could not be parsed:', e.message);
-          resolve(null);
+          resolve({ status: res.statusCode, data: null, retryAfter: 0, error: 'Invalid JSON response' });
         }
       });
     });
-    req.on('error', (e) => { console.error('Gemini translation connection failed:', e.message); resolve(null); });
-    req.on('timeout', () => { req.destroy(new Error('Gemini translation timeout')); resolve(null); });
+    req.on('error', (e) => resolve({ status: 0, data: null, error: e.message }));
+    req.on('timeout', () => req.destroy(new Error('Gemini request timed out')));
     req.write(body);
     req.end();
   });
+}
+
+async function translateWithGemini(texts, lang) {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey || !texts.length) return null;
+  const primaryModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  const models = [...new Set([primaryModel, 'gemini-3.6-flash'])];
+  const languageName = ({ ko: 'Korean', ja: 'Japanese', zh: 'Chinese', th: 'Thai', vi: 'Vietnamese',
+    id: 'Indonesian', es: 'Spanish', pt: 'Portuguese', fr: 'French', de: 'German', ar: 'Arabic' })[lang] || lang;
+  const prompt = `Translate each input string from ${languageName} into faithful, natural English. Do not summarize or add facts. Preserve proper names, group and member names, dates, numbers, punctuation, and meaning. Return exactly one translated string per input, in the same order, as a JSON array of strings only.\nINPUT:\n${JSON.stringify(texts)}`;
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+      maxOutputTokens: 8192
+    }
+  });
+  let lastError = null;
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await requestGemini(model, body, apiKey);
+      if (result.status >= 200 && result.status < 300 && result.data) {
+        try {
+          const raw = (((result.data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('').trim();
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return parsed.map((v) => String(v || '').trim());
+          lastError = 'Gemini returned an unexpected response format';
+        } catch (e) { lastError = 'Gemini response could not be parsed: ' + e.message; }
+        break;
+      }
+      const detail = result.data?.error?.message || result.error || 'API error';
+      lastError = `${result.status || 'network'} ${detail}`;
+      // 503 (capacity), 429 (quota), and transient gateway/network errors:
+      // wait once, then switch to the stable previous Flash model if needed.
+      const transient = !result.status || [429, 500, 502, 503, 504].includes(result.status);
+      if (!transient) break;
+      if (attempt === 0) {
+        const backoff = Math.min(10000, Math.max(1800, result.retryAfter * 1000 || 1800));
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+      }
+    }
+  }
+  console.error('Gemini translation failed after retry/model fallback:', lastError || 'unknown error');
+  return null;
 }
 
 /** Public no-key translation fallbacks, used if Gemini is unset or unavailable. */
