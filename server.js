@@ -542,18 +542,32 @@ async function translate(text, from) {
     }
   ];
 
+  const sourceScript = src === 'ko' ? /[\uac00-\ud7af]/g
+    : src === 'ja' ? /[\u3040-\u30ff\u4e00-\u9fff]/g
+    : /^zh/.test(src) || src === 'zh' ? /[\u4e00-\u9fff]/g
+    : null;
+  const looksUntranslated = (value) => {
+    if (!value || value.trim() === clean) return true;
+    if (!sourceScript) return false;
+    const chars = value.match(sourceScript) || [];
+    // A few original-script names can remain in a good translation. Reject
+    // only when the output still looks predominantly like the source language.
+    return chars.length / Math.max(1, value.length) > 0.32;
+  };
+
   for (const engine of engines) {
     try {
       const out = await engine();
       if (out) {
         const final = decodeEntities(out);
+        if (looksUntranslated(final)) continue; // try the independent fallback
         if (translationCache.size > 4000) translationCache.clear();
         translationCache.set(key, final);
         return final;
       }
     } catch (e) { /* try next engine */ }
   }
-  return clean; // give up: show the original
+  return clean; // give up: show the original only if every engine fails
 }
 
 /** Translate a list of strings in small parallel batches. */
@@ -1506,6 +1520,15 @@ function setPinned(id, pinned) {
   return it;
 }
 
+function updateItem(id, patch) {
+  load();
+  const it = state.items.find((i) => i.id === id);
+  if (!it) return null;
+  Object.assign(it, patch || {});
+  save();
+  return it;
+}
+
 function deleteItem(id) {
   load();
   const i = state.items.findIndex((x) => x.id === id);
@@ -1673,7 +1696,7 @@ function logSearch(entry) {
 }
 
 module.exports = {
-  load, save, hash, normUrl, normTitle, upsertItems, listItems, setPinned,
+  load, save, hash, normUrl, normTitle, upsertItems, listItems, setPinned, updateItem,
   deleteItem, undeleteAll, ensureSubjectFor, listSubjects, updateSubject,
   deleteSubject, sweep, pruneDeleted, markAllSeen, logSearch, prettyId, tagSubjectHits, subjectFollowUps
 };
@@ -1952,6 +1975,40 @@ async function runSearch({ reason = 'manual' } = {}) {
     // ---------- store ----------
     setProgress('store', done, total, 'Saving…');
     const res = db.upsertItems(collapsed);
+
+    // Backfill older stored cards that were saved before a translation retry
+    // succeeded. Keep their IDs (and therefore stars) stable while replacing
+    // only the display text; originals remain available for audit/debugging.
+    const legacy = db.listItems({ windowDays, limit: 300 })
+      .filter((it) => it.lang && it.lang !== 'en' &&
+        (!it.titleTranslated || (it.summary && !it.summaryTranslated)))
+      .slice(0, 60);
+    if (legacy.length) {
+      setProgress('process', done, total, 'Translating older headlines…');
+      await net.pool(legacy.map((it) => async () => {
+        const patch = {};
+        if (!it.titleTranslated && it.title) {
+          const translated = await net.translate(it.title, it.lang);
+          if (translated && translated !== it.title) {
+            patch.titleOriginal = it.titleOriginal || it.title;
+            patch.title = translated;
+            patch.titleTranslated = true;
+          }
+        }
+        if (it.summary && !it.summaryTranslated) {
+          if (net.detectLang(it.summary) === 'en') patch.summaryTranslated = true;
+          else {
+            const translated = await net.translate(it.summary, it.lang);
+            if (translated && translated !== it.summary) {
+              patch.summaryOriginal = it.summaryOriginal || it.summary;
+              patch.summary = E.tidySummary(translated);
+              patch.summaryTranslated = true;
+            }
+          }
+        }
+        if (Object.keys(patch).length) db.updateItem(it.id, patch);
+      }), 4);
+    }
 
     // ---------- standing-subject bookkeeping ----------
     // Anything that surfaced for a starred subject's artist+topic since this
