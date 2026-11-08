@@ -511,6 +511,8 @@ function detectLang(text = '') {
 
 const translationCache = new Map();
 let geminiUnavailableUntil = 0;
+let geminiRequestChain = Promise.resolve();
+let geminiLastRequestAt = 0;
 
 function looksUntranslated(value, original, lang) {
   if (!value || value.trim() === original.trim()) return true;
@@ -557,6 +559,18 @@ async function requestGemini(model, body, apiKey) {
   });
 }
 
+function queuedGeminiRequest(model, body, apiKey) {
+  const run = geminiRequestChain.then(async () => {
+    const interval = Math.max(0, Number(process.env.GEMINI_MIN_INTERVAL_MS || 6000));
+    const wait = interval - (Date.now() - geminiLastRequestAt);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    geminiLastRequestAt = Date.now();
+    return requestGemini(model, body, apiKey);
+  });
+  geminiRequestChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 async function translateWithGemini(texts, lang, { force = false } = {}) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey || !texts.length) return null;
@@ -577,12 +591,15 @@ async function translateWithGemini(texts, lang, { force = false } = {}) {
   let lastError = null;
   if (!force && Date.now() < geminiUnavailableUntil) return null;
   for (const model of models) {
-    const result = await requestGemini(model, body, apiKey);
+    const result = await queuedGeminiRequest(model, body, apiKey);
     if (result.status >= 200 && result.status < 300 && result.data) {
       try {
         const raw = (((result.data.candidates || [])[0] || {}).content?.parts || []).map((p) => p.text || '').join('').trim();
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed.map((v) => String(v || '').trim());
+        if (Array.isArray(parsed)) {
+          geminiUnavailableUntil = 0;
+          return parsed.map((v) => String(v || '').trim());
+        }
         lastError = 'Gemini returned an unexpected response format';
       } catch (e) { lastError = 'Gemini response could not be parsed: ' + e.message; }
       break;
@@ -1086,7 +1103,7 @@ __KPR_MODULES__["enrich.js"] = { exports: {}, loaded: false, require: __kprRequi
  *     article's dek + the group context
  *  4. tag each item with artists + topics, score it for ranking
  */
-const { translate, translateAll, detectLang, fetchDek, pool, stripTags } = require('./net');
+const { translateAll, detectLang, fetchDek, pool, stripTags } = require('./net');
 
 const { TOPICS, ARTISTS, FIXUPS } = require('./catalog');
 
@@ -1361,13 +1378,14 @@ async function enrichBatch(rawItems, { settings, artists, labelName = {}, budget
   await pool(needDek.slice(0, 40).map((it) => async () => {
     const d = await fetchDek(it.url);
     if (d && d.dek) {
-      const translated = it.lang && it.lang !== 'en' ? await translate(d.dek, it.lang) : d.dek;
-      it.summary = tidySummary(translated);
+      it.summary = tidySummary(d.dek);
       it.summaryOriginal = tidySummary(d.dek);
-      it.summaryTranslated = !it.lang || it.lang === 'en' || (translated && translated !== d.dek);
-      if (translated && translated.length > 12) it.summarySource = 'publisher';
+      it.summaryTranslated = detectLang(d.dek) === 'en';
+      if (d.dek.length > 12) it.summarySource = 'publisher';
     }
   }), 6);
+  // Batch publisher deks rather than calling Gemini once per article.
+  await translateSummaries(needDek.filter((it) => it.summary && detectLang(it.summary) !== 'en'), budget);
 
   // 2b. canonical spellings for machine-mangled names
   for (const it of items) {
@@ -2178,33 +2196,44 @@ async function runSearch({ reason = 'manual' } = {}) {
     // only the display text; originals remain available for audit/debugging.
     const legacy = db.listItems({ windowDays, limit: 300 })
       .filter((it) => it.lang && it.lang !== 'en' &&
-        (!it.titleTranslated || (it.summary && !it.summaryTranslated)))
+        (it.titleTranslated !== true || (it.summary && it.summaryTranslated !== true)))
       .slice(0, 60);
     if (legacy.length) {
       setProgress('process', done, total, 'Translating older headlines…');
-      await net.pool(legacy.map((it) => async () => {
+      const patches = new Map();
+      const targets = [];
+      for (const it of legacy) {
         const patch = {};
-        if (!it.titleTranslated && it.title) {
-          const translated = await net.translate(it.title, it.lang);
-          if (translated && translated !== it.title) {
-            patch.titleOriginal = it.titleOriginal || it.title;
-            patch.title = translated;
-            patch.titleTranslated = true;
-          }
+        if (it.titleTranslated !== true && it.title) {
+          const sourceTitle = it.titleOriginal || it.title;
+          if (it.titleTranslated === false || net.detectLang(it.title) === it.lang) {
+            targets.push({ id: it.id, field: 'title', text: sourceTitle, lang: it.lang });
+          } else patch.titleTranslated = true;
         }
-        if (it.summary && !it.summaryTranslated) {
-          if (net.detectLang(it.summary) === 'en') patch.summaryTranslated = true;
-          else {
-            const translated = await net.translate(it.summary, it.lang);
-            if (translated && translated !== it.summary) {
-              patch.summaryOriginal = it.summaryOriginal || it.summary;
-              patch.summary = E.tidySummary(translated);
-              patch.summaryTranslated = true;
-            }
-          }
+        if (it.summary && it.summaryTranslated !== true) {
+          const sourceSummary = it.summaryRaw || it.summaryOriginal || it.summary;
+          if (it.summaryTranslated === false || net.detectLang(it.summary) === it.lang) {
+            targets.push({ id: it.id, field: 'summary', text: sourceSummary, lang: it.lang });
+          } else patch.summaryTranslated = true;
         }
-        if (Object.keys(patch).length) db.updateItem(it.id, patch);
-      }), 4);
+        if (Object.keys(patch).length) patches.set(it.id, patch);
+      }
+      const out = targets.length ? await net.translateAll(targets.map((t) => ({ text: t.text, lang: t.lang })), 4) : [];
+      targets.forEach((t, i) => {
+        if (!out[i] || out[i] === t.text) return;
+        const patch = patches.get(t.id) || {};
+        if (t.field === 'title') {
+          patch.titleOriginal = patch.titleOriginal || t.text;
+          patch.title = E.applyFixups(out[i]);
+          patch.titleTranslated = true;
+        } else {
+          patch.summaryOriginal = patch.summaryOriginal || t.text;
+          patch.summary = E.tidySummary(E.applyFixups(out[i]));
+          patch.summaryTranslated = true;
+        }
+        patches.set(t.id, patch);
+      });
+      for (const [id, patch] of patches) db.updateItem(id, patch);
     }
 
     // ---------- standing-subject bookkeeping ----------
